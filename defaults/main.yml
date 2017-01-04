@@ -1,0 +1,9 @@
+---
+password_hacluster_user: MGJmY2Q1M2Y5YzIxNjQ0ZDRhZjY1NjIw
+master_node: server1
+cluster_name: mycluster
+mysql_port: 3306
+node1: server1
+node2: server2
+resource_drbd_name: mysql-apps
+Mysql_VIP: 10.100.100.3

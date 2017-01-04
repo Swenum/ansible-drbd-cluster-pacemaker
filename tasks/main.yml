@@ -1,0 +1,133 @@
+---
+- name: Add  ha-clustering repo
+  copy:
+    src=network:ha-clustering:Stable.repo
+    dest=/etc/yum.repos.d/ha-clustering:Stable.repo
+
+- name: Add repo for drbd packages
+  copy:
+    src=elrepo.repo
+    dest=/etc/yum.repos.d/elrepo.repo
+
+- rpm_key:
+    state: present
+    key: /etc/pki/rpm-gpg/RPM-GPG-KEY-elrepo.org
+
+- name: Install packages  
+  yum:
+    pkg: "{{ item }}"
+    state: installed
+  with_items:
+      - haproxy
+      - pcs
+      - resource-agents
+      - crmsh
+      - pacemaker
+      - drbd84-utils
+      - kmod-drbd84
+
+# Open UDP-ports 5404 and 5405 for Corosync
+# Open TCP-port 2224 for PCS
+
+- name: start and enable services
+  service:
+    name: "{{ item }}"
+    state: started
+    enabled: yes
+    with_items:
+      - corosync
+      - pacemaker
+
+- name: set password for user hacluster
+  shell: echo {{ password_hacluster_user }} | passwd --stdin hacluster
+
+- name: Authentificate all nodes
+  command: pcs cluster auth {{ node1 }} {{ node2 }} -u hacluster -p "{{ password_hacluster_user }}" --force
+  when: inventory_hostname == master_node
+
+- name: create cluster name
+  command: pcs cluster setup --name ha-{{ cluster_name }} {{ node1 }} {{ node2 }}
+  when: inventory_hostname == master_node
+
+- name: Enable clusters on nodes
+  command: pcs cluster enable --all
+  when: inventory_hostname == master_node
+
+- name: Start clusters on nodes
+  command: pcs cluster start --all
+  when: inventory_hostname == master_node
+
+- name: set stonith-enabled
+  command: pcs property set stonith-enabled=false
+  when: inventory_hostname == master_node
+
+- name: set no-quorum-policy
+  command: pcs property set no-quorum-policy=ignore
+  when: inventory_hostname == master_node
+
+- name: load drbd module on all nodes
+  command: modprobe brbd
+
+- name: Copy drbd resource file to all nodes
+  template:
+    src=src=drbd.d/{{ resource_drbd_name }}.res.j2 
+    dest=/etc/drbd.d/{{ resource_drbd_name }}.res
+
+- name: Create drbd resource on all nodes
+  command: drbdadm create-md {{ resource_drbd_name }}
+
+- name: start drbd resource on all nodes
+  command:  drbdadm up {{ resource_drbd_name }}
+
+- name: configure node01 as the primary
+  command: drbdadm primary --force {{ resource_drbd_name }}
+  when: inventory_hostname == master_node
+
+- name: configure node01 as the primary
+  filesystem:
+    fstype: xfs
+    dev: /dev/drbd0
+
+- name: resource create Mysql_data
+  command: pcs resource create Mysql_data ocf:linbit:drbd drbd_resource={{ resource_drbd_name }} op monitor interval=5s  
+  when: inventory_hostname == master_node
+
+- name: make resource master
+  command: pcs resource master C_Mysql_data Mysql_data master-max=1 master-node-max=1 clone-max=2 clone-node-max=1 notify=true 
+  when: inventory_hostname == master_node
+
+- name: resource create Mysql_fs
+  command: pcs resource create Mysql_fs Filesystem device="/dev/drbd0" directory="/var/lib/mysql" fstype="xfs"
+  when: inventory_hostname == master_node
+
+- name: constraint colocation add Mysql_fs with C_Mysql_data
+  command: pcs constraint colocation add Mysql_fs with C_Mysql_data INFINITY with-rsc-role=Master
+  when: inventory_hostname == master_node
+
+- name: constraint order promote C_Mysql_data
+  command: pcs constraint order promote C_Mysql_data then start Mysql_fs
+  when: inventory_hostname == master_node
+
+- name: resource create Mysql_service
+  command: pcs resource create Mysql_service ocf:heartbeat:mysql binary="/usr/bin/mysqld_safe" config="/etc/mysql/my.cnf" datadir="/var/lib/mysql" pid="/var/run/mysqld/mysqld.pid" socket="/var/run/mysqld/mysqld.sock" additional_parameters="--bind-address=0.0.0.0" op start timeout=60s op stop timeout=60s op monitor interval=5s timeout=30s
+  when: inventory_hostname == master_node
+
+- name: constraint colocation add Mysql_service
+  command: pcs constraint colocation add Mysql_service with Mysql_fs INFINITY
+  when: inventory_hostname == master_node
+
+- name: constraint order Mysql_fs
+  command: pcs constraint order Mysql_fs then Mysql_service
+  when: inventory_hostname == master_node
+
+- name: resource create Mysql_VIP
+  command: pcs resource create Mysql_VIP ocf:heartbeat:IPaddr2 ip={{ Mysql_VIP }} cidr_netmask=16 op monitor interval=5s
+  when: inventory_hostname == master_node
+
+- name: constraint colocation add Mysql_VIP
+  command: pcs constraint colocation add Mysql_VIP with Mysql_service INFINITY
+  when: inventory_hostname == master_node
+
+- name: constraint order Mysql_service
+  command: pcs constraint order Mysql_service then Mysql_VIP
+  when: inventory_hostname == master_node
